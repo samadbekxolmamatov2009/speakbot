@@ -1,7 +1,8 @@
 """Tariflar: Bepul / Standard / Pro (VIP hozircha sotuvda emas - faqat avval olganlar uchun ishlaydi).
 
 Limit Konuşma va Yazma uchun ALOHIDA, MOCK bilan hisoblanadi (mockni ochish - 1 ta; uning qismlari va
-qolgan qismlari shu davrda bepul; har qism bir marta ishlanadi):
+qolgan qismlari shu davrda bepul; bepul foydalanuvchida har qism bir marta ishlanadi, pullik obunachi qayta
+ishlay oladi - qayta ishlash limitdan olinmaydi):
   🆓 Bepul    — faqat 🎁 1 ta sinov mock (bir marta); qolgan mocklar ko'rinmaydi
   ⭐ Standard — 30 ta mock (30 + 30), 69 000 so'm / 30 kun; ro'yxatda birinchi 30 ta mock ko'rinadi
   💎 Pro      — 60 ta mock (60 + 60), 129 000 so'm / 60 kun, 2 ekspert baholashi; birinchi 60 ta mock
