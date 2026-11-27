@@ -1,0 +1,880 @@
+"""Tariflar (Bepul / Standard / Pro) va admin paneli: foydalanuvchilar, premium, adminlar, sozlamalar, statistika.
+
+O'quvchi:  «🚀 Tarifni yaxshilash» - tariflar, joriy tarif va oylik limit, to'lov ma'lumoti.
+Admin:     👥 Foydalanuvchilar (karta -> premium berish / bloklash), 💎 Premium, 👮 Adminlar,
+           ⚙️ Sozlamalar (limitlar, to'lov matni), 📈 Statistika.
+To'lov QO'LDA kiritiladi: admin tarif va muddatni tanlab, to'lov izohini yozadi.
+"""
+import asyncio
+import html
+import logging
+import os
+from datetime import datetime, timedelta
+
+from aiogram import BaseMiddleware, F, Router
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+import access
+import config
+import payments
+import db
+import plans
+from access import usage_text
+from config import ADMIN_IDS, PREMIUM_ENABLED, is_admin, is_owner
+
+log = logging.getLogger("premium")
+
+router = Router()
+router.message.filter(F.chat.type == "private")
+
+BTN_PREMIUM = "🚀 Tarifni yaxshilash"
+OLD_PREMIUM_BUTTONS = {"💎 Premium"}  # eski klaviaturalardagi tugma ham ishlashi uchun
+DEFAULT_INFO = "Obuna narxi va to'lov usullari uchun admin bilan bog'laning."
+DURATIONS = [30, 90, 180, 365]
+INFO_KEY = "premium_info"
+USERS_PER_PAGE = 10
+
+
+class PremGrant(StatesGroup):
+    user = State()
+    plan = State()
+    days = State()
+    note = State()
+
+
+class PremRevoke(StatesGroup):
+    user = State()
+
+
+class PremInfo(StatesGroup):
+    text = State()
+
+
+class AdminAdd(StatesGroup):
+    user = State()
+
+
+class UserSearch(StatesGroup):
+    query = State()
+
+
+class LimitEdit(StatesGroup):
+    value = State()
+
+
+def e(value) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def _local(until: str) -> str:
+    """UTC matnini O'zbekiston vaqtidagi sanaga (kun.oy.yil) o'giradi."""
+    dt = datetime.strptime(until, "%Y-%m-%d %H:%M:%S") + timedelta(hours=5)
+    return dt.strftime("%d.%m.%Y")
+
+
+def _who(u: dict) -> str:
+    """Foydalanuvchini ko'rsatish: ism, @username, ID."""
+    name = u.get("full_name") or "Noma'lum"
+    tag = f" @{u['username']}" if u.get("username") else ""
+    return f"{e(name)}{tag} (<code>{u['telegram_id']}</code>)"
+
+
+def _kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def _limit_line(plan: str) -> str:
+    return plans.offer_line(plan)
+
+
+# ======================================================================
+# Bloklangan foydalanuvchilar: bot ularga javob bermaydi
+# ======================================================================
+
+class BlockMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user and user.id in config.BLOCKED_IDS and not is_admin(user.id):
+            return None  # jimgina e'tiborsiz qoldiramiz
+        return await handler(event, data)
+
+
+# ======================================================================
+# O'QUVCHI: «🚀 Tarifni yaxshilash»
+# ======================================================================
+
+@router.message(F.text.in_({BTN_PREMIUM} | OLD_PREMIUM_BUTTONS))
+@router.message(Command("premium", "tarif"))
+async def premium_info(message: Message, state: FSMContext):
+    await state.clear()
+    await _send_tariffs(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "tariffs")
+async def premium_info_cb(callback: CallbackQuery, state: FSMContext):
+    """Inline «🚀 Tarifni yaxshilash» tugmasi (sinov mockdan keyin, mocklar ro'yxatida)."""
+    await state.clear()
+    await callback.answer()
+    await _send_tariffs(callback.message, callback.from_user.id)
+
+
+async def _send_tariffs(target: Message, uid: int):
+    if not PREMIUM_ENABLED:
+        return await target.answer("Hozircha barcha imkoniyatlar hamma uchun cheksiz. 🎉")
+    if is_admin(uid):
+        return await target.answer("👮 Siz adminsiz — sizda cheklov yo'q.")
+    await send_tariff_poster(target.bot, target.chat.id, uid)
+
+
+POSTER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "tarif.jpg")
+POSTER_KEY = "tariff_poster_file_id"  # Telegram file_id: rasm bir marta yuklanadi, keyin shu id bilan yuboriladi
+
+
+async def send_tariff_poster(bot, chat_id: int, uid: int):
+    """«Tarifni yaxshilash»: tariflar rasmi, ostida karta raqami va chek yuborish tugmalari (boshqa matnsiz)."""
+    card = payments.card_text()
+    caption = f"💳 <code>{e(card)}</code>" if card else f"💳 {e(db.admin_contact())}"
+    rows = payments.pay_buttons()
+    if await access.limit_reached(uid):  # limiti tugagan obunachi - asosiy tugma «🔄 Yangi muddat boshlash»
+        rows = [[payments.renew_button()]] + rows[1:]
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    cached = db.setting(POSTER_KEY)
+    if cached:
+        try:
+            return await bot.send_photo(chat_id, cached, caption=caption, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            log.info("Saqlangan tarif rasmi yuborilmadi - fayldan qayta yuklanadi")
+    msg = await bot.send_photo(chat_id, FSInputFile(POSTER_PATH), caption=caption, parse_mode="HTML", reply_markup=kb)
+    try:
+        await db.set_setting(POSTER_KEY, msg.photo[-1].file_id)
+    except Exception:
+        log.warning("Tarif rasmi file_id sini saqlab bo'lmadi", exc_info=True)
+
+
+async def trial_upsell(bot, user_id: int, exam: dict | None, kind: str):
+    """Bepul foydalanuvchi sinov mockning bo'limini (Konuşma yoki Yazma) tugatdi - tariflar haqida ma'lumot.
+    Natija allaqachon yuborilgan - bu yerdagi xato o'quvchiga ta'sir qilmasin."""
+    try:
+        await _trial_upsell(bot, user_id, exam, kind)
+    except Exception:
+        log.warning("Tariflar haqidagi xabarni yuborib bo'lmadi (%s)", user_id, exc_info=True)
+
+
+async def _trial_upsell(bot, user_id: int, exam: dict | None, kind: str):
+    mock_id = (exam or {}).get("mock_id")
+    if not mock_id or not await access.free_trial_only(user_id) or mock_id != await db.trial_mock_id():
+        return
+    done = (await access.done_parts(user_id, mock_id))[kind]
+    need = set()
+    for ex in await db.mock_exams(mock_id):
+        if (ex.get("kind") or "speaking") != kind or not ex.get("q_count"):
+            continue
+        # yazma mockda bitta "full" test: 1 va 2-qism birga yoki alohida ishlanadi
+        need |= {"1", "2"} if kind == "writing" and ex.get("part") == "full" else {ex.get("part")}
+    if not done or not need <= done:
+        return  # bo'limning hali ishlanmagan qismlari bor
+    await bot.send_message(user_id, f"🎉 <b>Sinov mockning {plans.KIND_LABEL[kind]} bo'limini tugatdingiz!</b>",
+                           parse_mode="HTML")
+    await send_tariff_poster(bot, user_id, user_id)
+
+
+# ======================================================================
+# ADMIN yordamchilari
+# ======================================================================
+
+async def _not_admin(message: Message, state: FSMContext):
+    """Admin huquqi olib tashlangan odamning eski (admin) holati - tozalab, oddiy menyuni ko'rsatamiz."""
+    await state.clear()
+    from bot import main_keyboard  # aylana importdan qochish uchun shu yerda
+    await message.answer("Bo'limni tanlang 👇", reply_markup=main_keyboard(message.from_user.id))
+
+
+async def _resolve(message: Message, must_exist: bool = False) -> dict | None:
+    """Admin yuborgan ID, @username, t.me havola yoki ism bo'yicha foydalanuvchini topadi; topilmasa - xabar beradi.
+    Botda hali yo'q ID: must_exist=True bo'lsa rad etiladi, aks holda ogohlantirish bilan qabul qilinadi."""
+    user = await db.find_user(message.text or "")
+    if not user:
+        await message.answer(
+            "Foydalanuvchi topilmadi. Telegram ID (raqam), @username yoki botdagi ismini yuboring.\n"
+            "Bekor qilish: /cancel"
+        )
+        return None
+    if not user.get("known"):
+        if must_exist:
+            await message.answer(
+                f"⚠️ <code>{user['telegram_id']}</code> ID bilan odam botda yo'q. U avval botga /start yuborsin, "
+                "keyin qayta urinib ko'ring. Bekor qilish: /cancel",
+                parse_mode="HTML",
+            )
+            return None
+        await message.answer(
+            f"⚠️ <code>{user['telegram_id']}</code> ID bilan odam botda hali yo'q (u /start bosmagan). "
+            "ID to'g'riligini tekshiring — davom etsangiz, u botga kirganda tarif ishlaydi.",
+            parse_mode="HTML",
+        )
+    return user
+
+
+async def _notify(bot, user_id: int, text: str) -> bool:
+    try:
+        await bot.send_message(user_id, text, parse_mode="HTML")
+        return True
+    except Exception:
+        log.info("Foydalanuvchiga (%s) xabar yuborib bo'lmadi - u botni ishga tushirmagan bo'lishi mumkin", user_id)
+        return False
+
+
+def _guard(callback: CallbackQuery) -> bool:
+    return is_admin(callback.from_user.id)
+
+
+# ======================================================================
+# ADMIN: 💎 Premium
+# ======================================================================
+
+async def _premium_view():
+    rows = await db.list_active_premium(12)
+    std, pro = await db.count_active_premium("standard"), await db.count_active_premium("pro")
+    vip = await db.count_active_premium("vip")
+    single = {p: await db.count_active_premium(p) for p in plans.SINGLE}
+    soon = await db.list_expiring_premium(7, 6)
+    lines = [f"💎 <b>Premium</b>\n⭐ Standard: <b>{std}</b> • 💎 Pro: <b>{pro}</b> • 👑 VIP: <b>{vip}</b>\n"
+             f"🎙 {single['sp30']} • 🎤 {single['sp60']} • ✍️ {single['wr30']} • 📝 {single['wr60']}\n"]
+    if not PREMIUM_ENABLED:
+        lines.append("⚠️ Premium tizimi o'chirilgan (PREMIUM_ENABLED=0) — hamma uchun cheksiz.\n")
+    for r in rows:
+        lines.append(f"• {plans.PLANS.get(r['plan'], plans.PLANS['pro'])['icon']} {_who(r)} — {_local(r['until'])} gacha")
+    total = std + pro + vip + sum(single.values())
+    if total > len(rows):
+        lines.append(f"… va yana {total - len(rows)} ta")
+    if soon:
+        lines.append("\n⏰ <b>7 kun ichida tugaydi:</b>")
+        lines += [f"• {_who(r)} — {_local(r['until'])}" for r in soon]
+    kb = _kb([
+        [_btn("➕ Premium berish", "pg_start"), _btn("➖ Bekor qilish", "pr_start")],
+        [_btn("⬅️ Orqaga", "admin")],
+    ])
+    return "\n".join(lines)[:4000], kb
+
+
+@router.callback_query(F.data == "adm_prem")
+async def premium_menu(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    text, kb = await _premium_view()
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer()
+
+
+# ---- Premium berish: foydalanuvchi -> tarif -> muddat -> to'lov izohi ----
+
+@router.callback_query(F.data == "pg_start")
+async def grant_start(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    await state.set_state(PremGrant.user)
+    await callback.message.answer(
+        "➕ <b>Premium berish</b>\n\nFoydalanuvchining <b>Telegram ID</b> raqamini yoki <b>@username</b>'ini yuboring.\n"
+        "(@username faqat botdan foydalangan odamlar uchun ishlaydi. Ro'yxatdan tanlash: «👥 Foydalanuvchilar».) "
+        "Bekor qilish: /cancel",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+async def _ask_plan(target: Message, state: FSMContext, user: dict):
+    await state.clear()
+    await state.update_data(target=user["telegram_id"], label=_who(user))
+    await state.set_state(PremGrant.plan)
+    current = await db.get_premium(user["telegram_id"])
+    now = f"\nHozir: <b>{e(plans.name(current['plan']))}</b>, {_local(current['until'])} gacha" if current else ""
+    await target.answer(
+        f"👤 {_who(user)}{now}\n\nQaysi tarif?\n" + "\n".join(plans.offer_line(p) for p in plans.ON_SALE),
+        parse_mode="HTML",
+        reply_markup=_kb([[_btn(plans.name(p), f"pgp:{user['telegram_id']}:{p}") for p in plans.ON_SALE[i:i + 2]]
+                          for i in range(0, len(plans.ON_SALE), 2)]),
+    )
+
+
+@router.message(PremGrant.user)
+async def grant_user(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await _not_admin(message, state)
+    user = await _resolve(message)
+    if user:
+        await _ask_plan(message, state, user)
+
+
+@router.callback_query(F.data.startswith("pgu:"))
+async def user_grant(callback: CallbackQuery, state: FSMContext):
+    """Foydalanuvchi kartasidan premium berish."""
+    if not _guard(callback):
+        return await callback.answer()
+    user = await db.find_user(callback.data.split(":")[1])
+    await callback.answer()
+    if user:
+        await _ask_plan(callback.message, state, user)
+
+
+def _target_matches(data: dict, uid: str) -> bool:
+    """Tugma aynan hozir premium berilayotgan odamga tegishlimi (eski xabardagi tugma boshqa odamniki bo'lishi mumkin)."""
+    return uid.lstrip("-").isdigit() and data.get("target") == int(uid)
+
+
+@router.callback_query(StateFilter(PremGrant.plan, PremGrant.days), F.data.startswith("pgp:"))
+async def grant_plan(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    bits = callback.data.split(":")
+    if len(bits) != 3 or bits[2] not in plans.PAID:
+        return await callback.answer()
+    if not _target_matches(await state.get_data(), bits[1]):
+        return await callback.answer("Bu tugma boshqa foydalanuvchi uchun edi. Eng oxirgi xabardagi tugmani bosing.", show_alert=True)
+    plan, uid = bits[2], bits[1]
+    await state.update_data(plan=plan)
+    await state.set_state(PremGrant.days)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    kb = _kb([[_btn(f"{d} kun", f"pgd:{uid}:{d}") for d in DURATIONS[:2]], [_btn(f"{d} kun", f"pgd:{uid}:{d}") for d in DURATIONS[2:]]])
+    await callback.message.answer(
+        f"{plans.name(plan)}. Necha kunlik beramiz? Tugmani bosing yoki kunlar sonini raqam bilan yozing.", reply_markup=kb
+    )
+    await callback.answer()
+
+
+async def _ask_note(target: Message, state: FSMContext, days: int):
+    await state.update_data(days=days)
+    await state.set_state(PremGrant.note)
+    await target.answer(
+        f"🗓 {days} kun.\n\nTo'lov haqida izoh yozing (summa, to'lov usuli — masalan: <i>50 000 so'm, Click</i>). "
+        "Izoh kerak bo'lmasa «-» yuboring.",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(PremGrant.days, F.data.startswith("pgd:"))
+async def grant_days_button(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    bits = callback.data.split(":")
+    if len(bits) != 3 or not bits[2].isdigit():
+        return await callback.answer()
+    if not _target_matches(await state.get_data(), bits[1]):
+        return await callback.answer("Bu tugma boshqa foydalanuvchi uchun edi. Eng oxirgi xabardagi tugmani bosing.", show_alert=True)
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _ask_note(callback.message, state, int(bits[2]))
+
+
+@router.message(PremGrant.days)
+async def grant_days_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await _not_admin(message, state)
+    text = (message.text or "").strip()
+    if not text.isdigit() or not 1 <= int(text) <= 3650:
+        return await message.answer("Kunlar sonini 1 dan 3650 gacha raqam bilan yozing yoki tugmani bosing.")
+    await _ask_note(message, state, int(text))
+
+
+@router.message(PremGrant.note)
+async def grant_note(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await _not_admin(message, state)
+    note = (message.text or "").strip()
+    if not note:
+        return await message.answer("Izohni matn bilan yozing yoki «-» yuboring.")
+    data = await state.get_data()
+    await state.clear()
+    if not data.get("target") or not data.get("days"):
+        return await message.answer("Jarayon uzilib qolgan. «💎 Premium» bo'limidan qaytadan boshlang.")
+    target, days, plan = data["target"], data["days"], data.get("plan", "pro")
+    restart = await access.limit_reached(target)  # limiti tugagan obunachi - yangi davr hozirdan
+    until = await db.grant_premium(target, days, "" if note == "-" else note[:200], message.from_user.id, plan,
+                                   restart=restart)
+    delivered = await _notify(
+        message.bot, target,
+        ("🔄 Obunangiz yangidan boshlandi — limit to'liq yangilandi.\n" if restart else "")
+        + f"{e(plans.name(plan))} <b>faollashtirildi!</b>\nTugash sanasi: <b>{_local(until)}</b>\n"
+        f"Limit ({plans.period_days(plan)} kun): {plans.limits_text(plan)}"
+        + (" • 2 ekspert baholashi" if plans.raters_for(plan) > 1 else "") + ".\n\nOmad! 🎉",
+    )
+    text, kb = await _premium_view()
+    warn = "" if delivered else "\n⚠️ Foydalanuvchiga xabar yetkazilmadi (u botga /start bosmagan yoki botni to'xtatgan)."
+    await message.answer(
+        f"✅ {data['label']} — {e(plans.name(plan))} <b>{_local(until)}</b> gacha "
+        + (f"(limiti tugagan edi — obuna hozirdan {days} kunga qayta boshlandi).{warn}" if restart
+           else f"({days} kun qo'shildi).{warn}"),
+        parse_mode="HTML",
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---- Premiumni bekor qilish ----
+
+@router.callback_query(F.data == "pr_start")
+async def revoke_start(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    await state.set_state(PremRevoke.user)
+    await callback.message.answer(
+        "➖ <b>Premiumni bekor qilish</b>\n\nFoydalanuvchining Telegram ID'si yoki @username'ini yuboring. Bekor qilish: /cancel",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+async def _confirm_revoke(target: Message, user: dict, back: str):
+    prem = await db.get_premium(user["telegram_id"])
+    if not prem:
+        return await target.answer(f"👤 {_who(user)} da faol premium yo'q.", parse_mode="HTML")
+    await target.answer(
+        f"👤 {_who(user)}\n{e(plans.name(prem['plan']))}: {_local(prem['until'])} gacha.\n\nBekor qilamizmi?",
+        parse_mode="HTML",
+        reply_markup=_kb([[_btn("✅ Ha, bekor qilish", f"prv:{user['telegram_id']}:{_stamp(prem['until'])}"),
+                           _btn("❌ Yo'q", back)]]),
+    )
+
+
+@router.message(PremRevoke.user)
+async def revoke_user(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await _not_admin(message, state)
+    user = await _resolve(message)
+    if not user:
+        return
+    await state.clear()
+    await _confirm_revoke(message, user, "adm_prem")
+
+
+def _stamp(until: str) -> str:
+    return "".join(ch for ch in str(until) if ch.isdigit())
+
+
+@router.callback_query(F.data.startswith("usr_rv:"))
+async def user_revoke_ask(callback: CallbackQuery):
+    if not _guard(callback):
+        return await callback.answer()
+    uid = int(callback.data.split(":")[1])
+    await callback.answer()
+    await _confirm_revoke(callback.message, await db.find_user(str(uid)), f"usr:{uid}")
+
+
+@router.callback_query(F.data.startswith("prv:"))
+async def revoke_do(callback: CallbackQuery):
+    if not _guard(callback):
+        return await callback.answer()
+    bits = callback.data.split(":")
+    uid = int(bits[1])
+    prem = await db.get_premium(uid)
+    if not prem or (len(bits) > 2 and bits[2] != _stamp(prem["until"])):
+        return await callback.answer("Obuna holati o'zgargan (yoki allaqachon bekor qilingan). Kartani qayta oching.",
+                                     show_alert=True)
+    await db.revoke_premium(uid, callback.from_user.id)
+    text, kb = await _premium_view()
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer("Premium bekor qilindi")
+
+
+# ======================================================================
+# ADMIN: ⚙️ Sozlamalar (limitlar va to'lov matni)
+# ======================================================================
+
+async def _settings_view():
+    info = await db.get_setting(INFO_KEY, DEFAULT_INFO)
+    text = (
+        "⚙️ <b>Sozlamalar</b>\n\n<b>Tariflar</b> (bepul — kalendar oy, pullik — har 30 kun):\n"
+        + "\n".join(f"• {_limit_line(p)}" for p in plans.PLANS)
+        + "\n\nO'zgartirish uchun tarifni tanlang (Konuşma limiti, Yazma limiti, narx)."
+        + f"\n\n💳 <b>Karta raqami</b>: <code>{e(payments.card_text() or 'kiritilmagan')}</code>"
+        + f"\n👤 <b>O'quvchilar yozadigan admin</b>: {e(db.admin_contact())}"
+        + f"\n<b>Qo'shimcha to'lov matni</b> (ixtiyoriy):\n<i>{e(info)}</i>"
+    )
+    kb = _kb([
+        [_btn(f"✏️ {plans.name(p)}", f"lim:{p}") for p in list(plans.PLANS)[:2]],
+        [_btn(f"✏️ {plans.name(p)}", f"lim:{p}") for p in list(plans.PLANS)[2:]],
+        [_btn("💳 Karta raqami", "card_edit"), _btn("👤 Admin username", "ac_edit")],
+        [_btn("📝 Qo'shimcha to'lov matni", "pi_edit")],
+        [_btn("⬅️ Boss paneli", "boss")],
+    ])
+    return text, kb
+
+
+@router.callback_query(F.data == "adm_settings")
+async def settings_menu(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    text, kb = await _settings_view()
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer()
+
+
+_FIELD_LABEL = {"speaking": "🎙 Konuşma limiti", "writing": "✍️ Yazma limiti", "price": "💰 Narx"}
+
+
+@router.callback_query(F.data.startswith("lim:"))
+async def limit_plan(callback: CallbackQuery, state: FSMContext):
+    """lim:<tarif> - qaysi qiymatni o'zgartirish; lim:<tarif>:<speaking|writing|price> - qiymat so'raladi."""
+    if not _guard(callback):
+        return await callback.answer()
+    bits = callback.data.split(":")
+    plan = bits[1] if len(bits) > 1 else ""
+    if plan not in plans.PLANS:
+        return await callback.answer()
+    await state.clear()
+    if len(bits) == 2:
+        fields = ["speaking", "writing"] + ([] if plan == "free" else ["price"])
+        kb = _kb([[_btn(_FIELD_LABEL[f], f"lim:{plan}:{f}") for f in fields], [_btn("⬅️ Orqaga", "adm_settings")]])
+        await callback.message.edit_text(f"{_limit_line(plan)}\n\nNimani o'zgartiramiz?", parse_mode="HTML", reply_markup=kb)
+        return await callback.answer()
+    field = bits[2]
+    if field not in _FIELD_LABEL or (field == "price" and plan == "free"):
+        return await callback.answer()
+    await state.set_state(LimitEdit.value)
+    await state.update_data(plan=plan, field=field)
+    if field == "price":
+        now, ask = plans.money(plans.price_for(plan)), "Yangi narxni so'mda yozing (masalan <code>30000</code>)."
+    else:
+        lim = plans.limit_for(plan, field)
+        period = "oyiga" if plan == "free" else f"har {plans.period_days(plan)} kunda"
+        now = "cheksiz" if lim is None else f"{period} {lim} ta"
+        ask = f"{period.capitalize()} necha ta bo'lsin? Raqam yozing yoki cheksiz uchun <code>cheksiz</code>."
+    await callback.message.answer(f"{e(plans.name(plan))} — {_FIELD_LABEL[field]}: hozir <b>{e(now)}</b>.\n\n{ask} "
+                                  "Bekor qilish: /cancel", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(LimitEdit.value)
+async def limit_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await _not_admin(message, state)
+    data = await state.get_data()
+    plan, field = data.get("plan"), data.get("field", "speaking")
+    if plan not in plans.PLANS:
+        await state.clear()
+        return await message.answer("Jarayon uzilib qolgan. «⚙️ Sozlamalar» dan qaytadan boshlang.")
+    text = (message.text or "").strip().lower().replace(" ", "").replace("so'm", "").replace("сум", "")
+    if field == "price":
+        if not text.isdigit() or not 0 < int(text) <= 100_000_000:
+            return await message.answer("Narxni raqam bilan yozing (masalan 30000).")
+        await db.set_setting(f"price_{plan}", str(int(text)))
+    else:
+        if text in ("cheksiz", "unlimited", "-"):
+            value = "unlimited"
+        elif text.isdigit() and 0 <= int(text) <= 100000:
+            value = str(int(text))
+        else:
+            return await message.answer("Raqam (0 dan 100000 gacha) yoki «cheksiz» yozing.")
+        await db.set_setting(f"limit_{plan}_{field}", value)
+    await state.clear()
+    view, kb = await _settings_view()
+    await message.answer("✅ Saqlandi.")
+    await message.answer(view, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data == "pi_edit")
+async def info_edit(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    await state.set_state(PremInfo.text)
+    current = await db.get_setting(INFO_KEY, DEFAULT_INFO)
+    await callback.message.answer(
+        "📝 <b>To'lov ma'lumoti</b> — o'quvchi «🚀 Tarifni yaxshilash» tugmasini bosganda shu matnni ko'radi "
+        "(narxlar, karta raqami, admin bilan aloqa va h.k.).\n\n"
+        f"Hozirgi matn:\n<i>{e(current)}</i>\n\nYangi matnni yuboring (ko'pi bilan 1000 belgi). "
+        "Standart matnga qaytarish uchun «-» yuboring. Bekor qilish: /cancel",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(PremInfo.text)
+async def info_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await _not_admin(message, state)
+    text = (message.text or "").strip()
+    if not text:
+        return await message.answer("Matn yuboring yoki «-» yozing.")
+    if len(text) > 1000:
+        return await message.answer(f"Matn juda uzun ({len(text)} belgi). 1000 belgidan oshmasin.")
+    await db.set_setting(INFO_KEY, "" if text == "-" else text)
+    await state.clear()
+    view, kb = await _settings_view()
+    await message.answer("✅ Saqlandi.")
+    await message.answer(view, parse_mode="HTML", reply_markup=kb)
+
+
+# ======================================================================
+# ADMIN: 👮 Adminlar
+# ======================================================================
+
+async def _admins_view(viewer_id: int):
+    """👮 Adminlarni boshqarish: kim boss, kim admin, qaysi bo'limlari ochiq va 30 kunda nima qildi."""
+    import roles  # aylana importdan qochish uchun shu yerda
+    extra, act = await asyncio.gather(db.list_admins(), db.admin_activity(30))
+    bosses = await asyncio.gather(*[db.get_user(uid) for uid in ADMIN_IDS])
+
+    def stats(uid: int) -> str:
+        a = act.get(uid) or {}
+        return f"30 kunda: {a.get('grants', 0)} obuna, {a.get('checks', 0)} chek"
+
+    lines = ["👮 <b>Adminlarni boshqarish</b>", "━━━━━━━━━━━━━━━━",
+             f"👑 <b>Bosslar</b> — {len(ADMIN_IDS)} ta (hamma huquq; Render'dagi ADMIN_IDS, botdan o'chirilmaydi):"]
+    for uid, u in zip(ADMIN_IDS, bosses):
+        lines.append(f"• {_who(u or {'telegram_id': uid})}\n   <i>{stats(uid)}</i>")
+    lines.append(f"\n👮 <b>Adminlar</b> — {len(extra)} ta:" if extra else "\n👮 Hali admin qo'shilmagan.")
+    rows = []
+    for a in extra:
+        perms = roles.perms_of(a["telegram_id"])
+        summary = ("hamma bo'lim" if perms == set(roles.SECTIONS) else
+                   ", ".join(roles.SECTIONS[k][0].split(" ", 1)[1] for k in roles.SECTIONS if k in perms) or "hech narsa ochilmagan")
+        lines.append(f"• {_who(a)}\n   🔐 {e(summary)}\n   <i>{stats(a['telegram_id'])}</i>")
+        label = (a.get("full_name") or str(a["telegram_id"]))[:28]
+        rows.append([_btn(f"🔐 {label} — huquqlar", f"prm:{a['telegram_id']}")])
+    lines.append("\n<i>Adminni bosing — bo'limlarini yoqing/yoping yoki adminlikdan oling.</i>" if extra else
+                 "\n<i>Admin — yordamchi: siz ochgan bo'limlar bilan ishlaydi (masalan, faqat chek tasdiqlash).</i>")
+    rows.append([_btn("➕ Admin qo'shish", "ad_add")])
+    rows.append([_btn("⬅️ Boss paneli", "boss")])
+    return "\n".join(lines), _kb(rows)
+
+
+@router.callback_query(F.data == "adm_admins")
+async def admins_menu(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    text, kb = await _admins_view(callback.from_user.id)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "ad_add")
+async def admin_add_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return await callback.answer("Faqat asosiy adminlar admin qo'sha oladi.", show_alert=True)
+    await state.clear()
+    await state.set_state(AdminAdd.user)
+    await callback.message.answer(
+        "➕ <b>Admin qo'shish</b>\n\nYangi adminning Telegram ID'si yoki @username'ini yuboring "
+        "(u avval botga /start yuborgan bo'lishi kerak). Bekor qilish: /cancel",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(AdminAdd.user)
+async def admin_add_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await _not_admin(message, state)
+    user = await _resolve(message, must_exist=True)
+    if not user:
+        return
+    uid = user["telegram_id"]
+    await state.clear()
+    if is_admin(uid):
+        return await message.answer(f"👤 {_who(user)} allaqachon admin.", parse_mode="HTML")
+    await db.add_admin(uid, message.from_user.id)
+    await _notify(message.bot, uid, "👮 Siz admin etib tayinlandingiz. Menyuni yangilash uchun /start yuboring.")
+    text, kb = await _admins_view(message.from_user.id)
+    await message.answer(f"✅ {_who(user)} admin qilindi.", parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("adr:"))
+async def admin_remove_ask(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return await callback.answer("Faqat asosiy adminlar.", show_alert=True)
+    uid = int(callback.data.split(":")[1])
+    u = await db.get_user(uid) or {"telegram_id": uid}
+    await callback.message.edit_text(
+        f"👤 {_who(u)}\n\nAdminlikdan olamizmi?",
+        parse_mode="HTML",
+        reply_markup=_kb([[_btn("✅ Ha, olish", f"adrd:{uid}"), _btn("❌ Yo'q", f"prm:{uid}")]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adrd:"))
+async def admin_remove_do(callback: CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return await callback.answer("Faqat asosiy adminlar.", show_alert=True)
+    uid = int(callback.data.split(":")[1])
+    if is_owner(uid):  # asosiy adminlarni o'chirib bo'lmaydi
+        return await callback.answer("Asosiy adminni o'chirib bo'lmaydi.", show_alert=True)
+    await db.remove_admin(uid)
+    await _notify(callback.bot, uid, "Siz endi admin emassiz. Menyuni yangilash uchun /start yuboring.")
+    text, kb = await _admins_view(callback.from_user.id)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer("Olib tashlandi")
+
+
+# ======================================================================
+# ADMIN: 👥 Foydalanuvchilar (ro'yxat -> karta -> premium / bloklash)
+# ======================================================================
+
+async def _users_view(page: int):
+    total = await db.count_users()
+    pages = max(1, -(-total // USERS_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+    users = await db.list_users(page * USERS_PER_PAGE, USERS_PER_PAGE)
+    first = page * USERS_PER_PAGE + 1
+    which = "Oxirgi qo'shilganlar" if page == 0 else "Ro'yxat"
+    lines = [f"👥 <b>Foydalanuvchilar</b> — jami {total} ta\n━━━━━━━━━━━━━━━━\n"
+             f"{which} ({first}–{min(total, first + USERS_PER_PAGE - 1)}). "
+             "Kerakli odamni 🔎 qidiruv orqali tez topasiz: ID, @username yoki ism."]
+    rows = []
+    for u in users:
+        mark = "🚫 " if u["blocked"] else (plans.PLANS[u["plan"] or "pro"]["icon"] + " " if u["is_premium"] else "")
+        label = (u.get("full_name") or u.get("username") or str(u["telegram_id"]))[:28]
+        rows.append([_btn(f"{mark}{label}", f"usr:{u['telegram_id']}")])
+    nav = []
+    if page > 0:
+        nav.append(_btn("◀️ Yangiroq", f"adm_users:{page - 1}"))
+    if page < pages - 1:
+        nav.append(_btn("Eskiroq ▶️", f"adm_users:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([_btn("🔎 Qidirish (ID, @username, ism)", "usr_search")])
+    rows.append([_btn("⬅️ Orqaga", "admin")])
+    return "\n".join(lines), _kb(rows)
+
+
+@router.callback_query(F.data.startswith("adm_users:"))
+async def users_menu(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    text, kb = await _users_view(int(callback.data.split(":")[1]))
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer()
+
+
+async def _user_card(user: dict):
+    uid = user["telegram_id"]
+    prem, usage_line, results, hist = await asyncio.gather(  # parallel - karta bitta kutishda ochiladi
+        db.get_premium(uid), usage_text(uid), db.user_results(uid, 5), db.premium_history(uid, 3))
+    plan = "vip" if is_admin(uid) else (prem["plan"] if prem else "free")
+    status = f"{e(plans.name(plan))}" + (f" — <b>{_local(prem['until'])}</b> gacha" if prem else "")
+    if is_admin(uid):
+        status += " • 👮 admin"
+    if uid in config.BLOCKED_IDS:
+        status += " • 🚫 bloklangan"
+    lines = [
+        f"👤 {_who(user)}",
+        status,
+        usage_line,
+    ]
+    if results:
+        lines.append("\n<b>Oxirgi natijalar:</b>")
+        for r in results:
+            icon = "✍️" if r["kind"] == "writing" else "🎙"
+            score = f"{float(r['raw_score']):g}" if r.get("raw_score") is not None else str(r["score"])
+            lines.append(f"{icon} {e(r['title'] or '?')} — {score} ({e(r['level'])})")
+    if hist:
+        lines.append("\n<b>Premium tarixi:</b>")
+        for h in hist:
+            if h["action"] == "grant":
+                note = f", {e(h['amount'])}" if h.get("amount") else ""
+                lines.append(f"+ {e(plans.name(h['plan'] or 'pro'))} {h['days']} kun{note}")
+            else:
+                lines.append("− bekor qilingan")
+    rows = [[_btn("💎 Premium berish / uzaytirish", f"pgu:{uid}")]]
+    if prem:
+        rows.append([_btn("➖ Premiumni bekor qilish", f"usr_rv:{uid}")])
+    if not is_admin(uid):
+        rows.append([_btn("✅ Blokdan chiqarish" if uid in config.BLOCKED_IDS else "🚫 Bloklash", f"usr_bl:{uid}")])
+    rows.append([_btn("⬅️ Ro'yxat", "adm_users:0")])
+    return "\n".join(lines)[:4000], _kb(rows)
+
+
+@router.callback_query(F.data.startswith("usr:"))
+async def user_open(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    text, kb = await _user_card(await db.find_user(callback.data.split(":")[1]))
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("usr_bl:"))
+async def user_block_toggle(callback: CallbackQuery):
+    if not _guard(callback):
+        return await callback.answer()
+    uid = int(callback.data.split(":")[1])
+    if is_admin(uid):
+        return await callback.answer("Adminni bloklab bo'lmaydi — avval adminlikdan oling.", show_alert=True)
+    blocked = uid not in config.BLOCKED_IDS
+    await db.set_blocked(uid, blocked)
+    text, kb = await _user_card(await db.find_user(str(uid)))
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.answer("Bloklandi" if blocked else "Blokdan chiqarildi")
+
+
+@router.callback_query(F.data == "usr_search")
+async def user_search_start(callback: CallbackQuery, state: FSMContext):
+    if not _guard(callback):
+        return await callback.answer()
+    await state.clear()
+    await state.set_state(UserSearch.query)
+    await callback.message.answer("🔎 Foydalanuvchining Telegram ID'si, @username'i yoki ismini yuboring. Bekor qilish: /cancel")
+    await callback.answer()
+
+
+@router.message(UserSearch.query)
+async def user_search(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await _not_admin(message, state)
+    found = await db.search_users(message.text or "", limit=10)
+    if not found:
+        return await message.answer("Hech kim topilmadi. ID, @username yoki ismning bir qismini yozing. Bekor qilish: /cancel")
+    await state.clear()
+    if len(found) == 1:
+        text, kb = await _user_card({**found[0], "known": True})
+        return await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    rows = [[_btn((u.get("full_name") or u.get("username") or str(u["telegram_id"]))[:40], f"usr:{u['telegram_id']}")]
+            for u in found]
+    rows.append([_btn("⬅️ Ro'yxat", "adm_users:0")])
+    more = " (ko'pi bilan 10 tasi — aniqroq yozing)" if len(found) == 10 else ""
+    await message.answer(f"🔎 Topildi: {len(found)} ta{more}. Tanlang:", reply_markup=_kb(rows))
+
+
+# ======================================================================
+# ADMIN: 📈 Statistika
+# ======================================================================
+
+@router.callback_query(F.data == "adm_stats")
+async def stats_view(callback: CallbackQuery):
+    if not _guard(callback):
+        return await callback.answer()
+    s = await db.get_stats()
+    text = (
+        "📈 <b>Statistika</b>\n\n"
+        f"👥 Foydalanuvchilar: <b>{s['users']}</b> (bugun +{s['new_today']}, 7 kunda +{s['new_week']})\n"
+        f"🔥 Oxirgi 7 kunda faol: <b>{s['active_week']}</b>\n"
+        f"🚫 Bloklangan: <b>{s['blocked']}</b>\n\n"
+        f"⭐ Standard: <b>{s['standard']}</b> • 💎 Pro: <b>{s['pro']}</b> • 👑 VIP: <b>{s['vip']}</b>\n"
+        f"🎙 Konuşma 30: <b>{s['sp30']}</b> • 🎤 Konuşma 60: <b>{s['sp60']}</b> • "
+        f"✍️ Yazma 30: <b>{s['wr30']}</b> • 📝 Yazma 60: <b>{s['wr60']}</b>\n"
+        f"🧾 30 kunda berilgan obunalar: <b>{s['grants_month']}</b>\n\n"
+        f"🎙 Speaking: <b>{s['speaking']}</b> • ✍️ Writing: <b>{s['writing']}</b>\n"
+        f"📅 Tekshiruvlar — bugun: <b>{s['today']}</b>, 7 kun: <b>{s['week']}</b>, 30 kun: <b>{s['month']}</b>"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=_kb([[_btn("⬅️ Orqaga", "admin")]]))
+    await callback.answer()
