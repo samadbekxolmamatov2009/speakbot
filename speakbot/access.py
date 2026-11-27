@@ -288,15 +288,23 @@ async def usage_block(user_id: int) -> str:
 
 # ---------------------------------------------------------------- mockni qayta ishlab bo'lmaydi
 
-REDO_MSG = "Bu qismni allaqachon ishlagansiz — mockni qayta ishlab bo'lmaydi. Keyingi mockni tanlang 📚"
+REDO_MSG = ("Bu qismni allaqachon ishlagansiz. Qayta ishlash huquqi faqat pullik tarif obunachilarida — "
+            "«🚀 Tarifni yaxshilash». Yoki keyingi mockni tanlang 📚")
 
 
-async def done_parts(user_id: int, mock_id: int | None) -> dict[str, set[str]]:
+async def can_redo(user_id: int) -> bool:
+    """Ishlangan mockni qayta ishlash huquqi: pullik obunachilar va adminlar. Bepul foydalanuvchida yo'q
+    (premium tizimi o'chiq bo'lsa - hamma uchun ochiq). Qayta ishlash limitdan qayta olinmaydi (mock_opened)."""
+    return is_admin(user_id) or not PREMIUM_ENABLED or await get_plan(user_id) != "free"
+
+
+async def done_parts(user_id: int, mock_id: int | None, raw: bool = False) -> dict[str, set[str]]:
     """Mockdagi yopilgan (ishlangan) qismlar: {"speaking": {"1.1", ..., "full"?}, "writing": {"1", "2", "full"?}}.
-    Har qism bir marta ishlanadi; biror qismi ishlangan bo'lsa, o'sha bo'limning Full mock'i yopiladi.
-    Adminlar uchun hech narsa yopilmaydi."""
+    Bepul foydalanuvchida har qism bir marta ishlanadi; biror qismi ishlangan bo'lsa, o'sha bo'limning Full mock'i
+    yopiladi. Qayta ishlash huquqi bor (pullik / admin) foydalanuvchida hech narsa yopilmaydi; raw=True - ✅ belgisi
+    uchun haqiqatan ishlangan qismlar (adminlarda baribir bo'sh)."""
     out: dict[str, set[str]] = {"speaking": set(), "writing": set()}
-    if not mock_id or is_admin(user_id):
+    if not mock_id or is_admin(user_id) or (not raw and await can_redo(user_id)):
         return out
     for r in await db.user_done(user_id):
         if r.get("mock_id") != mock_id or r["kind"] not in out:

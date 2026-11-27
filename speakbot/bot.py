@@ -35,7 +35,7 @@ import grader
 import report
 import roles
 import writing
-from access import (REDO_MSG, already_done, check_access, done_counts, done_parts, free_trial_only, get_plan,
+from access import (REDO_MSG, already_done, can_redo, check_access, done_counts, done_parts, free_trial_only, get_plan,
                     limit_reached, lock_reason, mocks_done, usage_block, usage_text, visible_mocks)
 import payments
 from config import EXAM_LANGUAGE, WEBAPP_URL, is_admin, is_owner
@@ -407,7 +407,7 @@ async def _mocks_view(user_id: int, page: int = 0, kind: str | None = None):
                      "uchun.</i>")
     elif config.PREMIUM_ENABLED and not is_admin(user_id):
         lines.append(f"\n💼 {await usage_text(user_id)}\n<i>Mockni ochsangiz, limitdan 1 ta olinadi. Har bir qism "
-                     "<b>bir marta</b> ishlanadi — ishlangan mockni qayta ishlab bo'lmaydi.</i>")
+                     "Ishlangan mockni qayta ishlash mumkin — limitdan qayta olinmaydi.</i>")
     if renew:  # obunachi limitni muddatidan oldin tugatdi - kutmasdan qayta boshlashi mumkin
         lines.append("\n🔄 <b>Limitingiz tugadi.</b> Kutish shart emas — «🔄 Yangi muddat boshlash» tugmasi bilan "
                      "tarifni qayta oling: obuna hozirdan yangidan boshlanadi va limit to'liq yangilanadi.")
@@ -541,9 +541,10 @@ async def mock_speaking(callback: CallbackQuery, state: FSMContext):
     if not allowed:
         return await callback.answer(reason, show_alert=True)
     await state.clear()
-    done = (await done_parts(callback.from_user.id, m["id"]))["speaking"]
+    done = (await done_parts(callback.from_user.id, m["id"], raw=True))["speaking"]
+    redo = await can_redo(callback.from_user.id)  # pullik obunachi: ishlangan qismni qayta ishlay oladi
     rows, lines = [], [f"🎙 <b>{e(m['title'])} — {SPEAKING_NAME}</b>", "━━━━━━━━━━━━━━━━"]
-    full = all(p in m["speaking"] for p in SP_PARTS) and not done
+    full = all(p in m["speaking"] for p in SP_PARTS) and (not done or redo)
     if full:
         lines.append("🔥 <b>Full mock</b> — Part 1.1 → 1.2 → 2 → 3 ketma-ket (~10 daqiqa), xuddi imtihondagidek. "
                      "Oxirida umumiy ball (75 lik) va har qism tahlili.")
@@ -553,12 +554,15 @@ async def mock_speaking(callback: CallbackQuery, state: FSMContext):
         if p in m["speaking"]:
             info = part_info("speaking", p)
             lines.append(f"• <b>Part {p}</b> — {e(info['about'])}")
-    parts = [InlineKeyboardButton(text=f"✅ Part {p}", callback_data="mk_done") if p in done
-             else _webapp(f"Part {p}", f"exam={m['speaking'][p]}") for p in SP_PARTS if p in m["speaking"]]
+    parts = [InlineKeyboardButton(text=f"✅ Part {p}", callback_data="mk_done") if p in done and not redo
+             else _webapp(f"🔁 Part {p}" if p in done else f"Part {p}", f"exam={m['speaking'][p]}")
+             for p in SP_PARTS if p in m["speaking"]]
     rows += [parts[i:i + 2] for i in range(0, len(parts), 2)]
-    if done:
+    if done and redo:
+        lines.append("\n🔁 — ishlangan qismlar: qayta ishlash mumkin (limitdan qayta olinmaydi).")
+    elif done:
         lines.append("\n✅ — ishlangan qismlar. Har qism <b>bir marta</b> ishlanadi; Full mock faqat hech bir qismi "
-                     "ishlanmagan mockda bo'ladi.")
+                     "ishlanmagan mockda bo'ladi. Qayta ishlash — pullik tarif obunachilarida.")
     rows.append([InlineKeyboardButton(text=f"⬅️ {SPEAKING_NAME} mocklari", callback_data="mk:0:s")])
     lines.append("\n🎧 Tinch joyda bo'ling va mikrofonga ruxsat bering.")
     await callback.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
@@ -577,12 +581,15 @@ async def mock_writing(callback: CallbackQuery, state: FSMContext):
     if not allowed:
         return await callback.answer(reason, show_alert=True)
     await state.clear()
-    done = (await done_parts(callback.from_user.id, m["id"]))["writing"]
+    done = (await done_parts(callback.from_user.id, m["id"], raw=True))["writing"]
+    redo = await can_redo(callback.from_user.id)  # pullik obunachi: ishlangan qismni qayta ishlay oladi
     B = InlineKeyboardButton
 
     def wbtn(label: str, mode: str) -> InlineKeyboardButton:
-        if mode in done:
+        if mode in done and not redo:
             return B(text=f"✅ {label}", callback_data="mk_done")
+        if mode in done:
+            label = f"🔁 {label}"
         return B(text=label, callback_data=f"wt:{wid}:{mode}" if mode else f"wt:{wid}")
 
     lines = [f"✍️ <b>{e(m['title'])} — {WRITING_NAME}</b>", "━━━━━━━━━━━━━━━━"]
@@ -594,14 +601,17 @@ async def mock_writing(callback: CallbackQuery, state: FSMContext):
             f"• <b>2-qism</b> — {e(WRITING_PARTS['2']['about'])} (~{WRITING_PARTS['2']['time']} daqiqa)",
         ]
         rows = [[wbtn("1-qism — 2 xat", "1"), wbtn("2-qism — blog", "2")]]
-        if not done:
+        if not done or redo:
             rows.insert(0, [wbtn("🔥 Full mock — 1 va 2-qism", "full")])
-        else:
-            lines.append("\n✅ — ishlangan qismlar. Har qism <b>bir marta</b> ishlanadi.")
+        if done and redo:
+            lines.append("\n🔁 — ishlangan qismlar: qayta ishlash mumkin (limitdan qayta olinmaydi).")
+        elif done:
+            lines.append("\n✅ — ishlangan qismlar. Har qism <b>bir marta</b> ishlanadi. Qayta ishlash — pullik tarif "
+                         "obunachilarida.")
     else:
         info = part_info("writing", m["writing"]["part"])
         lines.append(f"<b>{e(info['name'])}</b>")
-        rows = [[wbtn("✍️ Boshlash", "")]] if not done else []
+        rows = [[wbtn("✍️ Boshlash", "")]] if (not done or redo) else []
     rows.append([B(text=f"⬅️ {WRITING_NAME} mocklari", callback_data="mk:0:w")])
     await callback.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
